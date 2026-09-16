@@ -1,69 +1,76 @@
 import argparse
 import cv2
 import time
-from collections import defaultdict, deque
+
 from pathlib import Path
 from ultralytics import YOLO
 
+from analytics import Analytics
+from visualization import (
+    draw_trails,
+    draw_counting_line,
+    draw_stats
+)
+from benchmark import Benchmark
 
-# =========================================================
-# COMMAND-LINE ARGUMENTS
-# =========================================================
 
 def parse_args():
+
     parser = argparse.ArgumentParser(
-        description="Real-Time YOLO Object Detection and Tracking"
+        description="Real-Time Vision Tracker"
     )
 
     parser.add_argument(
         "--source",
-        default="0",
-        help="Camera number such as 0, or path to a video file"
+        default="0"
     )
 
     parser.add_argument(
         "--model",
-        default="yolo26s.pt",
-        help="YOLO model to use"
+        default="yolo26s.pt"
     )
 
     parser.add_argument(
         "--tracker",
-        default="tracktrack.yaml",
-        help="Tracker configuration"
+        default="tracktrack.yaml"
     )
 
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.45,
-        help="Detection confidence threshold"
+        default=0.45
     )
 
     parser.add_argument(
         "--iou",
         type=float,
-        default=0.50,
-        help="IoU threshold"
+        default=0.50
     )
 
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=640,
-        help="YOLO inference image size"
+        default=640
     )
 
     parser.add_argument(
         "--save",
-        action="store_true",
-        help="Save processed video"
+        action="store_true"
     )
 
     parser.add_argument(
         "--output",
-        default="outputs/tracked_output.mp4",
-        help="Output video path"
+        default="outputs/tracked_output.mp4"
+    )
+
+    parser.add_argument(
+        "--benchmark",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--benchmark-output",
+        default="outputs/benchmarks.csv"
     )
 
     return parser.parse_args()
@@ -72,117 +79,82 @@ def parse_args():
 args = parse_args()
 
 
-# =========================================================
-# SOURCE HANDLING
-# =========================================================
+# -----------------------------------------
+# Source
+# -----------------------------------------
 
-# If source is "0", "1", etc., convert it into an integer
-# so OpenCV knows it is a camera.
 if args.source.isdigit():
-    video_source = int(args.source)
+    source = int(args.source)
 else:
-    video_source = args.source
+    source = args.source
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-MIN_CONFIRM_FRAMES = 5
+# -----------------------------------------
+# Configuration
+# -----------------------------------------
 
 LINE_POSITION = 0.55
 LINE_MARGIN = 15
 
-TRACK_TIMEOUT_FRAMES = 90
 
-TRAIL_LENGTH = 30
-
-
-# =========================================================
-# SETUP
-# =========================================================
+# -----------------------------------------
+# Setup
+# -----------------------------------------
 
 model = YOLO(args.model)
 
-cap = cv2.VideoCapture(video_source)
+cap = cv2.VideoCapture(source)
 
 if not cap.isOpened():
-    print(f"ERROR: Could not open source: {args.source}")
+
+    print(
+        f"ERROR: Could not open "
+        f"source {args.source}"
+    )
+
     raise SystemExit(1)
 
 
-# =========================================================
-# VIDEO OUTPUT SETUP
-# =========================================================
+analytics = Analytics()
+
+benchmark = Benchmark()
 
 video_writer = None
 
-if args.save:
-
-    output_path = Path(args.output)
-
-    # Make outputs folder automatically if needed
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    print(f"Output will be saved to: {output_path}")
-
-
-# =========================================================
-# TRACKING MEMORY
-# =========================================================
-
-seen_ids = set()
-
-class_counts = defaultdict(int)
-
-track_hits = defaultdict(int)
-
-track_history = defaultdict(
-    lambda: deque(maxlen=TRAIL_LENGTH)
-)
-
-last_seen_frame = {}
-
-track_side = {}
-
-entered_ids = set()
-exited_ids = set()
-
-entered_count = 0
-exited_count = 0
+previous_time = time.perf_counter()
 
 frame_number = 0
 
-previous_time = time.perf_counter()
 
-
-# =========================================================
-# MAIN LOOP
-# =========================================================
+# -----------------------------------------
+# Main loop
+# -----------------------------------------
 
 while cap.isOpened():
 
     success, frame = cap.read()
 
     if not success:
-        print("End of video or could not read frame.")
         break
 
     frame_number += 1
 
-    frame_height, frame_width = frame.shape[:2]
+    frame_height, frame_width = (
+        frame.shape[:2]
+    )
 
     line_y = int(
         frame_height * LINE_POSITION
     )
 
+    processing_start = (
+        time.perf_counter()
+    )
 
-    # =====================================================
-    # YOLO + TRACKING
-    # =====================================================
+
+    # -------------------------------------
+    # YOLO + tracker
+    # -------------------------------------
 
     results = model.track(
         frame,
@@ -197,9 +169,11 @@ while cap.isOpened():
     result = results[0]
 
 
-    # =====================================================
-    # PROCESS TRACKED OBJECTS
-    # =====================================================
+    # -------------------------------------
+    # Analytics
+    # -------------------------------------
+
+    detection_count = 0
 
     if result.boxes.id is not None:
 
@@ -229,336 +203,123 @@ while cap.isOpened():
             .tolist()
         )
 
+        detection_count = len(track_ids)
 
-        for track_id, class_id, confidence, box in zip(
+        for (
+            track_id,
+            class_id,
+            confidence,
+            box
+        ) in zip(
             track_ids,
             classes,
             confidences,
             boxes
         ):
 
-            class_name = model.names[class_id]
-
-            last_seen_frame[track_id] = frame_number
-
-            track_hits[track_id] += 1
-
-
-            # =============================================
-            # CONFIRM OBJECT
-            # =============================================
-
-            if (
-                track_hits[track_id] >= MIN_CONFIRM_FRAMES
-                and track_id not in seen_ids
-            ):
-
-                seen_ids.add(track_id)
-
-                class_counts[class_name] += 1
-
-                print(
-                    f"CONFIRMED OBJECT -> "
-                    f"ID: {track_id} | "
-                    f"Class: {class_name} | "
-                    f"Confidence: {confidence:.2f}"
-                )
-
-
-            # =============================================
-            # CENTER POSITION
-            # =============================================
-
-            x1, y1, x2, y2 = box
-
-            center_x = int(
-                (x1 + x2) / 2
-            )
-
-            center_y = int(
-                (y1 + y2) / 2
-            )
-
-            track_history[track_id].append(
-                (center_x, center_y)
+            analytics.process_object(
+                track_id,
+                model.names[class_id],
+                confidence,
+                box,
+                frame_number,
+                line_y,
+                LINE_MARGIN
             )
 
 
-            # =============================================
-            # SIDE OF COUNTING LINE
-            # =============================================
-
-            current_side = None
-
-            if center_y < line_y - LINE_MARGIN:
-                current_side = "above"
-
-            elif center_y > line_y + LINE_MARGIN:
-                current_side = "below"
+    analytics.cleanup(
+        frame_number
+    )
 
 
-            # =============================================
-            # CROSSING DETECTION
-            # =============================================
-
-            if track_id in seen_ids:
-
-                previous_side = track_side.get(
-                    track_id
-                )
-
-                if current_side is not None:
-
-                    # ENTERED
-                    if (
-                        previous_side == "above"
-                        and current_side == "below"
-                        and track_id not in entered_ids
-                    ):
-
-                        entered_count += 1
-
-                        entered_ids.add(
-                            track_id
-                        )
-
-                        print(
-                            f"ENTERED -> "
-                            f"ID: {track_id} | "
-                            f"Class: {class_name}"
-                        )
-
-
-                    # EXITED
-                    elif (
-                        previous_side == "below"
-                        and current_side == "above"
-                        and track_id not in exited_ids
-                    ):
-
-                        exited_count += 1
-
-                        exited_ids.add(
-                            track_id
-                        )
-
-                        print(
-                            f"EXITED -> "
-                            f"ID: {track_id} | "
-                            f"Class: {class_name}"
-                        )
-
-
-                    track_side[track_id] = (
-                        current_side
-                    )
-
-
-    # =========================================================
-    # CLEAN UP OLD TRACKS
-    # =========================================================
-
-    tracks_to_remove = []
-
-    for track_id, last_frame in last_seen_frame.items():
-
-        frames_missing = (
-            frame_number - last_frame
-        )
-
-        if frames_missing > TRACK_TIMEOUT_FRAMES:
-
-            tracks_to_remove.append(
-                track_id
-            )
-
-
-    for track_id in tracks_to_remove:
-
-        track_history.pop(
-            track_id,
-            None
-        )
-
-        track_hits.pop(
-            track_id,
-            None
-        )
-
-        last_seen_frame.pop(
-            track_id,
-            None
-        )
-
-        track_side.pop(
-            track_id,
-            None
-        )
-
-        print(
-            f"REMOVED INACTIVE TRACK -> "
-            f"ID: {track_id}"
-        )
-
-
-    # =========================================================
-    # DRAW YOLO RESULTS
-    # =========================================================
+    # -------------------------------------
+    # Visualization
+    # -------------------------------------
 
     annotated_frame = result.plot()
 
-
-    # =========================================================
-    # MOVEMENT TRAILS
-    # =========================================================
-
-    for track_id, points in track_history.items():
-
-        if len(points) < 2:
-            continue
-
-        points_list = list(points)
-
-        for i in range(
-            1,
-            len(points_list)
-        ):
-
-            cv2.line(
-                annotated_frame,
-                points_list[i - 1],
-                points_list[i],
-                (255, 255, 255),
-                2
-            )
-
-
-    # =========================================================
-    # COUNTING LINE
-    # =========================================================
-
-    cv2.line(
+    draw_trails(
         annotated_frame,
-        (0, line_y),
-        (frame_width, line_y),
-        (0, 255, 255),
-        2
+        analytics.track_history
     )
 
-    cv2.putText(
+    draw_counting_line(
         annotated_frame,
-        "COUNTING LINE",
-        (
-            frame_width - 190,
-            line_y - 10
-        ),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 255),
-        2
+        line_y
     )
 
 
-    # =========================================================
-    # FPS
-    # =========================================================
-
-    current_time = time.perf_counter()
-
-    elapsed_time = (
-        current_time - previous_time
+    current_time = (
+        time.perf_counter()
     )
 
-    if elapsed_time > 0:
-        fps = 1 / elapsed_time
-    else:
-        fps = 0
+    elapsed = (
+        current_time
+        - previous_time
+    )
+
+    fps = (
+        1 / elapsed
+        if elapsed > 0
+        else 0
+    )
 
     previous_time = current_time
 
 
-    # =========================================================
-    # STATISTICS
-    # =========================================================
-
-    cv2.putText(
+    draw_stats(
         annotated_frame,
-        f"FPS: {fps:.1f}",
-        (20, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-
-    cv2.putText(
-        annotated_frame,
-        f"Unique Objects: {len(seen_ids)}",
-        (20, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-
-    cv2.putText(
-        annotated_frame,
-        f"Entered: {entered_count}",
-        (20, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-
-    cv2.putText(
-        annotated_frame,
-        f"Exited: {exited_count}",
-        (20, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
+        fps,
+        analytics
     )
 
 
-    y_position = 150
+    # -------------------------------------
+    # Benchmark
+    # -------------------------------------
 
-    for class_name, count in class_counts.items():
+    processing_time = (
+        time.perf_counter()
+        - processing_start
+    )
 
-        cv2.putText(
-            annotated_frame,
-            f"{class_name}: {count}",
-            (20, y_position),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2
-        )
-
-        y_position += 30
+    benchmark.record_frame(
+        processing_time,
+        detection_count
+    )
 
 
-    # =========================================================
-    # CREATE VIDEO WRITER
-    # =========================================================
+    # -------------------------------------
+    # Save video
+    # -------------------------------------
 
     if args.save and video_writer is None:
+
+        output_path = Path(
+            args.output
+        )
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
         source_fps = cap.get(
             cv2.CAP_PROP_FPS
         )
 
-        # Some webcams report FPS incorrectly
         if source_fps <= 0:
-            source_fps = 30.0
+            source_fps = 30
 
-        fourcc = cv2.VideoWriter_fourcc(
-            *"mp4v"
+        fourcc = (
+            cv2.VideoWriter_fourcc(
+                *"mp4v"
+            )
         )
 
         video_writer = cv2.VideoWriter(
-            args.output,
+            str(output_path),
             fourcc,
             source_fps,
             (
@@ -567,18 +328,6 @@ while cap.isOpened():
             )
         )
 
-        if not video_writer.isOpened():
-            print(
-                "ERROR: Could not create "
-                "output video."
-            )
-
-            video_writer = None
-
-
-    # =========================================================
-    # SAVE FRAME
-    # =========================================================
 
     if video_writer is not None:
 
@@ -587,22 +336,25 @@ while cap.isOpened():
         )
 
 
-    # =========================================================
-    # DISPLAY
-    # =========================================================
+    # -------------------------------------
+    # Display
+    # -------------------------------------
 
     cv2.imshow(
         "Real-Time Vision Tracker",
         annotated_frame
     )
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    if (
+        cv2.waitKey(1) & 0xFF
+        == ord("q")
+    ):
         break
 
 
-# =========================================================
-# FINAL CLEANUP
-# =========================================================
+# -----------------------------------------
+# Cleanup
+# -----------------------------------------
 
 cap.release()
 
@@ -612,28 +364,60 @@ if video_writer is not None:
 cv2.destroyAllWindows()
 
 
-# =========================================================
-# FINAL SUMMARY
-# =========================================================
+# -----------------------------------------
+# Final results
+# -----------------------------------------
 
 print()
 print("===== SESSION SUMMARY =====")
+
 print(
-    f"Unique Objects: {len(seen_ids)}"
-)
-print(
-    f"Entered: {entered_count}"
-)
-print(
-    f"Exited: {exited_count}"
+    f"Unique Objects: "
+    f"{len(analytics.seen_ids)}"
 )
 
-for class_name, count in class_counts.items():
-    print(
-        f"{class_name}: {count}"
+print(
+    f"Entered: "
+    f"{analytics.entered_count}"
+)
+
+print(
+    f"Exited: "
+    f"{analytics.exited_count}"
+)
+
+
+summary = benchmark.summary()
+
+print()
+print("===== PERFORMANCE =====")
+
+print(
+    f"Frames: "
+    f"{summary['frames']}"
+)
+
+print(
+    f"Average FPS: "
+    f"{summary['average_fps']:.2f}"
+)
+
+print(
+    f"Average frame time: "
+    f"{summary['average_frame_ms']:.2f} ms"
+)
+
+
+if args.benchmark:
+
+    benchmark.save_csv(
+        args.benchmark_output,
+        args.model,
+        args.tracker,
+        args.conf
     )
 
-if args.save:
     print(
-        f"Saved video: {args.output}"
+        f"Benchmark saved to: "
+        f"{args.benchmark_output}"
     )
