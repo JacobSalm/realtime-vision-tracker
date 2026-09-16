@@ -4,49 +4,85 @@ from collections import defaultdict, deque
 from ultralytics import YOLO
 
 
-# -------------------------
-# Configuration
-# -------------------------
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 MODEL_NAME = "yolo26s.pt"
 
 CONFIDENCE_THRESHOLD = 0.45
 IOU_THRESHOLD = 0.50
 
+# Object must survive this many frames before we trust it
 MIN_CONFIRM_FRAMES = 5
 
+# Position of counting line as percentage of screen height
+# 0.50 = exact middle
+LINE_POSITION = 0.55
 
-# -------------------------
-# Setup
-# -------------------------
+# Creates a small dead-zone around the line.
+# Helps prevent tiny movements from being counted as crossings.
+LINE_MARGIN = 15
 
-# Load YOLO model
+# Remove inactive track data after this many frames.
+# At ~30 FPS, 90 frames is about 3 seconds.
+TRACK_TIMEOUT_FRAMES = 90
+
+# Length of movement trail
+TRAIL_LENGTH = 30
+
+
+# =========================================================
+# SETUP
+# =========================================================
+
 model = YOLO(MODEL_NAME)
 
-# Open webcam
 cap = cv2.VideoCapture(0)
 
-# IDs that have been officially confirmed/countable
+
+# =========================================================
+# TRACKING / ANALYTICS MEMORY
+# =========================================================
+
+# Confirmed IDs we've seen
 seen_ids = set()
 
-# Number of frames each ID has appeared in
-track_hits = defaultdict(int)
-
-# Count confirmed objects by class
+# Counts by object class
 class_counts = defaultdict(int)
 
-# Movement history for each ID
+# How many frames each track has appeared
+track_hits = defaultdict(int)
+
+# Movement history
 track_history = defaultdict(
-    lambda: deque(maxlen=30)
+    lambda: deque(maxlen=TRAIL_LENGTH)
 )
 
-# FPS timer
+# Last frame where each ID was detected
+last_seen_frame = {}
+
+# Which side of the line each object was last on
+track_side = {}
+
+# Used to prevent multiple counts for the same ID
+entered_ids = set()
+exited_ids = set()
+
+# Counters
+entered_count = 0
+exited_count = 0
+
+# Current video frame number
+frame_number = 0
+
+# FPS calculation
 previous_time = time.perf_counter()
 
 
-# -------------------------
-# Main loop
-# -------------------------
+# =========================================================
+# MAIN LOOP
+# =========================================================
 
 while cap.isOpened():
 
@@ -56,7 +92,18 @@ while cap.isOpened():
         print("Could not read frame from camera.")
         break
 
-    # Run YOLO + TrackTrack
+    frame_number += 1
+
+    frame_height, frame_width = frame.shape[:2]
+
+    # Calculate counting-line position
+    line_y = int(frame_height * LINE_POSITION)
+
+
+    # =====================================================
+    # YOLO + TRACKING
+    # =====================================================
+
     results = model.track(
         frame,
         persist=True,
@@ -69,9 +116,10 @@ while cap.isOpened():
 
     result = results[0]
 
-    # -------------------------
-    # Process tracked objects
-    # -------------------------
+
+    # =====================================================
+    # PROCESS OBJECTS
+    # =====================================================
 
     if result.boxes.id is not None:
 
@@ -101,6 +149,7 @@ while cap.isOpened():
             .tolist()
         )
 
+
         for track_id, class_id, confidence, box in zip(
             track_ids,
             classes,
@@ -110,14 +159,17 @@ while cap.isOpened():
 
             class_name = model.names[class_id]
 
-            # -------------------------
-            # Confirmation system
-            # -------------------------
+            # Remember the last frame this ID existed
+            last_seen_frame[track_id] = frame_number
 
+            # Count number of frames this ID has survived
             track_hits[track_id] += 1
 
-            # Only count an object after it has survived
-            # for several frames
+
+            # =================================================
+            # CONFIRM OBJECT
+            # =================================================
+
             if (
                 track_hits[track_id] >= MIN_CONFIRM_FRAMES
                 and track_id not in seen_ids
@@ -134,9 +186,10 @@ while cap.isOpened():
                     f"Confidence: {confidence:.2f}"
                 )
 
-            # -------------------------
-            # Calculate center point
-            # -------------------------
+
+            # =================================================
+            # CENTER POSITION
+            # =================================================
 
             x1, y1, x2, y2 = box
 
@@ -147,15 +200,117 @@ while cap.isOpened():
                 (center_x, center_y)
             )
 
-    # -------------------------
-    # Draw YOLO detections
-    # -------------------------
+
+            # =================================================
+            # DETERMINE WHICH SIDE OF LINE
+            # =================================================
+
+            current_side = None
+
+            # Above line
+            if center_y < line_y - LINE_MARGIN:
+                current_side = "above"
+
+            # Below line
+            elif center_y > line_y + LINE_MARGIN:
+                current_side = "below"
+
+
+            # =================================================
+            # CROSSING DETECTION
+            # =================================================
+
+            # Only count trusted/confirmed tracks
+            if track_id in seen_ids:
+
+                previous_side = track_side.get(track_id)
+
+                # Only process if object is outside dead-zone
+                if current_side is not None:
+
+                    # -----------------------------------------
+                    # ENTERED
+                    # Above -> Below
+                    # -----------------------------------------
+
+                    if (
+                        previous_side == "above"
+                        and current_side == "below"
+                        and track_id not in entered_ids
+                    ):
+
+                        entered_count += 1
+                        entered_ids.add(track_id)
+
+                        print(
+                            f"ENTERED -> "
+                            f"ID: {track_id} | "
+                            f"Class: {class_name}"
+                        )
+
+
+                    # -----------------------------------------
+                    # EXITED
+                    # Below -> Above
+                    # -----------------------------------------
+
+                    elif (
+                        previous_side == "below"
+                        and current_side == "above"
+                        and track_id not in exited_ids
+                    ):
+
+                        exited_count += 1
+                        exited_ids.add(track_id)
+
+                        print(
+                            f"EXITED -> "
+                            f"ID: {track_id} | "
+                            f"Class: {class_name}"
+                        )
+
+
+                    # Save current side
+                    track_side[track_id] = current_side
+
+
+    # =========================================================
+    # TRACK CLEANUP
+    # =========================================================
+
+    tracks_to_remove = []
+
+    for track_id, last_frame in last_seen_frame.items():
+
+        frames_missing = frame_number - last_frame
+
+        if frames_missing > TRACK_TIMEOUT_FRAMES:
+            tracks_to_remove.append(track_id)
+
+
+    for track_id in tracks_to_remove:
+
+        # Remove temporary tracking information
+        track_history.pop(track_id, None)
+        track_hits.pop(track_id, None)
+        last_seen_frame.pop(track_id, None)
+        track_side.pop(track_id, None)
+
+        print(
+            f"REMOVED INACTIVE TRACK -> ID: {track_id}"
+        )
+
+
+    # =========================================================
+    # DRAW YOLO DETECTIONS
+    # =========================================================
 
     annotated_frame = result.plot()
 
-    # -------------------------
-    # Draw movement trails
-    # -------------------------
+
+    # =========================================================
+    # DRAW MOVEMENT TRAILS
+    # =========================================================
 
     for track_id, points in track_history.items():
 
@@ -174,9 +329,33 @@ while cap.isOpened():
                 2
             )
 
-    # -------------------------
-    # FPS calculation
-    # -------------------------
+
+    # =========================================================
+    # DRAW COUNTING LINE
+    # =========================================================
+
+    cv2.line(
+        annotated_frame,
+        (0, line_y),
+        (frame_width, line_y),
+        (0, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        "COUNTING LINE",
+        (frame_width - 190, line_y - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2
+    )
+
+
+    # =========================================================
+    # FPS
+    # =========================================================
 
     current_time = time.perf_counter()
 
@@ -189,9 +368,10 @@ while cap.isOpened():
 
     previous_time = current_time
 
-    # -------------------------
-    # Statistics overlay
-    # -------------------------
+
+    # =========================================================
+    # STATISTICS
+    # =========================================================
 
     cv2.putText(
         annotated_frame,
@@ -213,7 +393,29 @@ while cap.isOpened():
         2
     )
 
-    y_position = 90
+    cv2.putText(
+        annotated_frame,
+        f"Entered: {entered_count}",
+        (20, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        f"Exited: {exited_count}",
+        (20, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+
+    # Class counts
+    y_position = 150
 
     for class_name, count in class_counts.items():
 
@@ -229,9 +431,10 @@ while cap.isOpened():
 
         y_position += 30
 
-    # -------------------------
-    # Display
-    # -------------------------
+
+    # =========================================================
+    # DISPLAY
+    # =========================================================
 
     cv2.imshow(
         "Real-Time Vision Tracker",
@@ -241,6 +444,10 @@ while cap.isOpened():
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
+
+# =========================================================
+# CLEANUP
+# =========================================================
 
 cap.release()
 cv2.destroyAllWindows()
