@@ -6,5 +6,5 @@ model = YOLO("yolo26n.pt")
 model.track(
     source=0,
     show=True,
-    tracker="bytetrack.yaml"
+    tracker="custom_bytetrack.yaml"
 )
