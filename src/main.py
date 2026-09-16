@@ -1,24 +1,52 @@
 import cv2
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from ultralytics import YOLO
 
 
+# -------------------------
+# Configuration
+# -------------------------
+
+MODEL_NAME = "yolo26s.pt"
+
+CONFIDENCE_THRESHOLD = 0.45
+IOU_THRESHOLD = 0.50
+
+MIN_CONFIRM_FRAMES = 5
+
+
+# -------------------------
+# Setup
+# -------------------------
+
 # Load YOLO model
-model = YOLO("yolo26n.pt")
+model = YOLO(MODEL_NAME)
 
 # Open webcam
 cap = cv2.VideoCapture(0)
 
-# Store every tracking ID we have already counted
+# IDs that have been officially confirmed/countable
 seen_ids = set()
 
-# Store counts for each class
+# Number of frames each ID has appeared in
+track_hits = defaultdict(int)
+
+# Count confirmed objects by class
 class_counts = defaultdict(int)
 
-# Used to calculate FPS
+# Movement history for each ID
+track_history = defaultdict(
+    lambda: deque(maxlen=30)
+)
+
+# FPS timer
 previous_time = time.perf_counter()
 
+
+# -------------------------
+# Main loop
+# -------------------------
 
 while cap.isOpened():
 
@@ -28,50 +56,126 @@ while cap.isOpened():
         print("Could not read frame from camera.")
         break
 
-    # Run YOLO + ByteTrack
+    # Run YOLO + TrackTrack
     results = model.track(
         frame,
         persist=True,
-        tracker="bytetrack.yaml",
+        tracker="tracktrack.yaml",
+        conf=CONFIDENCE_THRESHOLD,
+        iou=IOU_THRESHOLD,
+        imgsz=640,
         verbose=False
     )
 
     result = results[0]
 
-    # Check if anything is currently being tracked
+    # -------------------------
+    # Process tracked objects
+    # -------------------------
+
     if result.boxes.id is not None:
 
-        track_ids = result.boxes.id.int().cpu().tolist()
-        classes = result.boxes.cls.int().cpu().tolist()
-        confidences = result.boxes.conf.cpu().tolist()
+        track_ids = (
+            result.boxes.id
+            .int()
+            .cpu()
+            .tolist()
+        )
 
-        for track_id, class_id, confidence in zip(
+        classes = (
+            result.boxes.cls
+            .int()
+            .cpu()
+            .tolist()
+        )
+
+        confidences = (
+            result.boxes.conf
+            .cpu()
+            .tolist()
+        )
+
+        boxes = (
+            result.boxes.xyxy
+            .cpu()
+            .tolist()
+        )
+
+        for track_id, class_id, confidence, box in zip(
             track_ids,
             classes,
-            confidences
+            confidences,
+            boxes
         ):
 
             class_name = model.names[class_id]
 
-            # Only count this tracking ID once
-            if track_id not in seen_ids:
+            # -------------------------
+            # Confirmation system
+            # -------------------------
+
+            track_hits[track_id] += 1
+
+            # Only count an object after it has survived
+            # for several frames
+            if (
+                track_hits[track_id] >= MIN_CONFIRM_FRAMES
+                and track_id not in seen_ids
+            ):
 
                 seen_ids.add(track_id)
 
                 class_counts[class_name] += 1
 
                 print(
-                    f"NEW OBJECT -> "
+                    f"CONFIRMED OBJECT -> "
                     f"ID: {track_id} | "
                     f"Class: {class_name} | "
                     f"Confidence: {confidence:.2f}"
                 )
 
-    # Let YOLO draw its normal boxes
+            # -------------------------
+            # Calculate center point
+            # -------------------------
+
+            x1, y1, x2, y2 = box
+
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+
+            track_history[track_id].append(
+                (center_x, center_y)
+            )
+
+    # -------------------------
+    # Draw YOLO detections
+    # -------------------------
+
     annotated_frame = result.plot()
 
     # -------------------------
-    # Calculate FPS
+    # Draw movement trails
+    # -------------------------
+
+    for track_id, points in track_history.items():
+
+        if len(points) < 2:
+            continue
+
+        points_list = list(points)
+
+        for i in range(1, len(points_list)):
+
+            cv2.line(
+                annotated_frame,
+                points_list[i - 1],
+                points_list[i],
+                (255, 255, 255),
+                2
+            )
+
+    # -------------------------
+    # FPS calculation
     # -------------------------
 
     current_time = time.perf_counter()
@@ -86,7 +190,7 @@ while cap.isOpened():
     previous_time = current_time
 
     # -------------------------
-    # Draw statistics
+    # Statistics overlay
     # -------------------------
 
     cv2.putText(
@@ -109,7 +213,6 @@ while cap.isOpened():
         2
     )
 
-    # Starting position for class counters
     y_position = 90
 
     for class_name, count in class_counts.items():
@@ -126,13 +229,15 @@ while cap.isOpened():
 
         y_position += 30
 
-    # Display window
+    # -------------------------
+    # Display
+    # -------------------------
+
     cv2.imshow(
         "Real-Time Vision Tracker",
         annotated_frame
     )
 
-    # Press Q to quit
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
